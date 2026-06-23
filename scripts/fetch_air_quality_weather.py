@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,10 @@ import requests
 MIN_PYTHON = (3, 11)
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+REQUEST_TIMEOUT = (10, 90)
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_BACKOFF_SECONDS = [2, 5, 10]
+DISTRICT_DELAY_SECONDS = 0.35
 
 AIR_QUALITY_FIELDS = [
     "pm10",
@@ -101,9 +107,37 @@ def local_open_meteo_time_to_timestamptz(value: str) -> str:
 
 
 def request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
-    response = requests.get(url, params=params, timeout=40)
-    response.raise_for_status()
-    return response.json()
+    max_attempts = len(RETRY_BACKOFF_SECONDS) + 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code in RETRY_STATUS_CODES:
+                response.raise_for_status()
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt == max_attempts:
+                raise
+            sleep_before_retry(attempt, exc)
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code not in RETRY_STATUS_CODES or attempt == max_attempts:
+                raise
+            sleep_before_retry(attempt, exc)
+
+    raise RuntimeError("Open-Meteo request failed after retries")
+
+
+def sleep_before_retry(attempt: int, exc: Exception) -> None:
+    base_delay = RETRY_BACKOFF_SECONDS[attempt - 1]
+    delay = base_delay + random.uniform(0, 0.5)
+    print(
+        f"Transient Open-Meteo request error on attempt {attempt}; "
+        f"retrying in {delay:.1f}s ({exc.__class__.__name__}).",
+        file=sys.stderr,
+    )
+    time.sleep(delay)
 
 
 def latest_hourly_row(payload: dict[str, Any], fields: list[str]) -> dict[str, Any]:
@@ -346,6 +380,7 @@ def main() -> int:
             rows.append(build_district_observation(district, timezone_name))
         except Exception as exc:  # noqa: BLE001 - record per-district failures for observability.
             failures.append({"district": district["district"], "error": str(exc)})
+        time.sleep(DISTRICT_DELAY_SECONDS)
 
     try:
         if not rows:
@@ -385,7 +420,10 @@ def main() -> int:
                 indent=2,
             )
         )
-        return 0 if not failures else 2
+        if failures:
+            failed_districts = ", ".join(failure["district"] for failure in failures)
+            print(f"Partial success. Failed districts: {failed_districts}", file=sys.stderr)
+        return 0
     except Exception as exc:
         supabase.request(
             "PATCH",

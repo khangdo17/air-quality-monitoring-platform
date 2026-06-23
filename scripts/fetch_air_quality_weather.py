@@ -420,10 +420,11 @@ def main() -> int:
                 indent=2,
             )
         )
+        rows_processed = len(rows)
         if failures:
             failed_districts = ", ".join(failure["district"] for failure in failures)
             print(f"Partial success. Failed districts: {failed_districts}", file=sys.stderr)
-        return 0
+        return 0 if rows_processed > 0 else 1
     except Exception as exc:
         supabase.request(
             "PATCH",

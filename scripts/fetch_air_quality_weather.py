@@ -27,10 +27,12 @@ import requests
 MIN_PYTHON = (3, 11)
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
-REQUEST_TIMEOUT = (10, 90)
+REQUEST_TIMEOUT = (10, 45)
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRY_BACKOFF_SECONDS = [2, 5, 10]
-DISTRICT_DELAY_SECONDS = 0.35
+BATCH_SIZE = 6
+BATCH_DELAY_SECONDS = 0.25
+API_REQUESTS_ATTEMPTED = 0
 
 AIR_QUALITY_FIELDS = [
     "pm10",
@@ -106,11 +108,14 @@ def local_open_meteo_time_to_timestamptz(value: str) -> str:
     return f"{value}:00+07:00" if len(value) == 16 else f"{value}+07:00"
 
 
-def request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
+def request_json(url: str, params: dict[str, Any]) -> Any:
+    global API_REQUESTS_ATTEMPTED
+
     max_attempts = len(RETRY_BACKOFF_SECONDS) + 1
 
     for attempt in range(1, max_attempts + 1):
         try:
+            API_REQUESTS_ATTEMPTED += 1
             response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if response.status_code in RETRY_STATUS_CODES:
                 response.raise_for_status()
@@ -138,6 +143,28 @@ def sleep_before_retry(attempt: int, exc: Exception) -> None:
         file=sys.stderr,
     )
     time.sleep(delay)
+
+
+def normalize_batch_response(response_json: Any, expected_count: int, source: str) -> list[dict[str, Any]]:
+    if isinstance(response_json, list):
+        responses = response_json
+    elif isinstance(response_json, dict):
+        responses = [response_json]
+    else:
+        raise RuntimeError(f"{source} response had unexpected type: {type(response_json).__name__}")
+
+    if len(responses) != expected_count:
+        raise RuntimeError(
+            f"{source} response count mismatch: expected {expected_count}, got {len(responses)}"
+        )
+
+    invalid_indexes = [
+        index for index, response in enumerate(responses) if not isinstance(response, dict)
+    ]
+    if invalid_indexes:
+        raise RuntimeError(f"{source} response included non-object items at indexes {invalid_indexes}")
+
+    return responses
 
 
 def latest_hourly_row(payload: dict[str, Any], fields: list[str]) -> dict[str, Any]:
@@ -280,15 +307,23 @@ class SupabaseRestClient:
         return response.json() if response.text else None
 
 
-def build_district_observation(district: dict[str, Any], timezone_name: str) -> dict[str, Any]:
-    latitude = district["latitude"]
-    longitude = district["longitude"]
+def format_coordinate_list(districts: list[dict[str, Any]], key: str) -> str:
+    return ",".join(f"{district[key]:.6f}" for district in districts)
+
+
+def fetch_batch_payloads(
+    districts: list[dict[str, Any]],
+    timezone_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    expected_count = len(districts)
+    latitudes = format_coordinate_list(districts, "latitude")
+    longitudes = format_coordinate_list(districts, "longitude")
 
     air_quality = request_json(
         AIR_QUALITY_URL,
         {
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": latitudes,
+            "longitude": longitudes,
             "hourly": ",".join(AIR_QUALITY_FIELDS),
             "timezone": timezone_name,
             "forecast_days": 1,
@@ -298,8 +333,8 @@ def build_district_observation(district: dict[str, Any], timezone_name: str) -> 
     weather = request_json(
         WEATHER_URL,
         {
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": latitudes,
+            "longitude": longitudes,
             "current": ",".join(WEATHER_CURRENT_FIELDS),
             "hourly": ",".join(WEATHER_HOURLY_FIELDS),
             "timezone": timezone_name,
@@ -307,6 +342,17 @@ def build_district_observation(district: dict[str, Any], timezone_name: str) -> 
         },
     )
 
+    return (
+        normalize_batch_response(air_quality, expected_count, "air quality"),
+        normalize_batch_response(weather, expected_count, "weather"),
+    )
+
+
+def build_observation_from_payloads(
+    district: dict[str, Any],
+    air_quality: dict[str, Any],
+    weather: dict[str, Any],
+) -> dict[str, Any]:
     air_row = latest_hourly_row(air_quality, AIR_QUALITY_FIELDS)
     weather_current = weather.get("current") or {}
     precipitation_row = latest_hourly_row(weather, WEATHER_HOURLY_FIELDS)
@@ -319,8 +365,8 @@ def build_district_observation(district: dict[str, Any], timezone_name: str) -> 
     return {
         "district": district["district"],
         "city": "Ho Chi Minh City",
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": district["latitude"],
+        "longitude": district["longitude"],
         "aqi": aqi,
         "pm25": pm25,
         "pm10": air_row.get("pm10"),
@@ -345,10 +391,37 @@ def build_district_observation(district: dict[str, Any], timezone_name: str) -> 
     }
 
 
+def build_batch_observations(
+    districts: list[dict[str, Any]],
+    timezone_name: str,
+) -> list[dict[str, Any]]:
+    air_quality_payloads, weather_payloads = fetch_batch_payloads(districts, timezone_name)
+
+    return [
+        build_observation_from_payloads(district, air_quality, weather)
+        for district, air_quality, weather in zip(
+            districts,
+            air_quality_payloads,
+            weather_payloads,
+            strict=True,
+        )
+    ]
+
+
+def build_district_observation(district: dict[str, Any], timezone_name: str) -> dict[str, Any]:
+    air_quality_payloads, weather_payloads = fetch_batch_payloads([district], timezone_name)
+    return build_observation_from_payloads(
+        district,
+        air_quality_payloads[0],
+        weather_payloads[0],
+    )
+
+
 def main() -> int:
     if sys.version_info < MIN_PYTHON:
         raise RuntimeError("Python 3.11 or newer is required")
 
+    started_monotonic = time.monotonic()
     load_dotenv()
 
     supabase = SupabaseRestClient(
@@ -375,12 +448,23 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
 
-    for district in HCM_DISTRICTS:
+    for batch_start in range(0, len(HCM_DISTRICTS), BATCH_SIZE):
+        district_batch = HCM_DISTRICTS[batch_start : batch_start + BATCH_SIZE]
+        batch_names = ", ".join(district["district"] for district in district_batch)
         try:
-            rows.append(build_district_observation(district, timezone_name))
-        except Exception as exc:  # noqa: BLE001 - record per-district failures for observability.
-            failures.append({"district": district["district"], "error": str(exc)})
-        time.sleep(DISTRICT_DELAY_SECONDS)
+            rows.extend(build_batch_observations(district_batch, timezone_name))
+        except Exception as batch_exc:  # noqa: BLE001 - batch fallback preserves data availability.
+            print(
+                f"Batch request failed for [{batch_names}]; falling back to per-district requests "
+                f"({batch_exc}).",
+                file=sys.stderr,
+            )
+            for district in district_batch:
+                try:
+                    rows.append(build_district_observation(district, timezone_name))
+                except Exception as exc:  # noqa: BLE001 - record per-district failures for observability.
+                    failures.append({"district": district["district"], "error": str(exc)})
+        time.sleep(BATCH_DELAY_SECONDS)
 
     try:
         if not rows:
@@ -415,6 +499,9 @@ def main() -> int:
                     "rows_processed": len(rows),
                     "rows_failed": len(failures),
                     "failures": failures,
+                    "api_requests_attempted": API_REQUESTS_ATTEMPTED,
+                    "batch_size": BATCH_SIZE,
+                    "duration_seconds": round(time.monotonic() - started_monotonic, 2),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -426,20 +513,38 @@ def main() -> int:
             print(f"Partial success. Failed districts: {failed_districts}", file=sys.stderr)
         return 0 if rows_processed > 0 else 1
     except Exception as exc:
-        supabase.request(
-            "PATCH",
-            "air_quality_pipeline_runs",
-            body={
-                "status": "failed",
-                "rows_processed": len(rows),
-                "rows_failed": len(failures) or len(HCM_DISTRICTS),
-                "error_message": str(exc),
-                "ended_at": utc_now_iso(),
-            },
-            params={"run_id": f"eq.{run_id}"},
-            prefer="return=minimal",
-        )
-        print(f"Pipeline failed: {exc}", file=sys.stderr)
+        failure_details = failures or [{"district": "global", "error": str(exc)}]
+        try:
+            supabase.request(
+                "PATCH",
+                "air_quality_pipeline_runs",
+                body={
+                    "status": "failed",
+                    "rows_processed": len(rows),
+                    "rows_failed": len(failure_details),
+                    "error_message": str(exc),
+                    "ended_at": utc_now_iso(),
+                },
+                params={"run_id": f"eq.{run_id}"},
+                prefer="return=minimal",
+            )
+        finally:
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "rows_processed": len(rows),
+                        "rows_failed": len(failure_details),
+                        "failures": failure_details,
+                        "api_requests_attempted": API_REQUESTS_ATTEMPTED,
+                        "batch_size": BATCH_SIZE,
+                        "duration_seconds": round(time.monotonic() - started_monotonic, 2),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            print(f"Pipeline failed: {exc}", file=sys.stderr)
         return 1
 
 

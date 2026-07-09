@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -33,6 +34,7 @@ RETRY_BACKOFF_SECONDS = [2, 5, 10]
 BATCH_SIZE = 6
 BATCH_DELAY_SECONDS = 0.25
 API_REQUESTS_ATTEMPTED = 0
+DEFAULT_CITY_TIMEZONE = "Asia/Bangkok"
 
 AIR_QUALITY_FIELDS = [
     "pm10",
@@ -45,17 +47,16 @@ AIR_QUALITY_FIELDS = [
     "uv_index",
 ]
 
-WEATHER_CURRENT_FIELDS = [
+WEATHER_HOURLY_FIELDS = [
     "temperature_2m",
     "relative_humidity_2m",
+    "precipitation_probability",
     "weather_code",
     "cloud_cover",
     "pressure_msl",
     "wind_speed_10m",
     "wind_gusts_10m",
 ]
-
-WEATHER_HOURLY_FIELDS = ["precipitation_probability"]
 
 HCM_DISTRICTS = [
     {"district": "Bình Tân", "latitude": 10.7656, "longitude": 106.6030},
@@ -102,10 +103,17 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def local_open_meteo_time_to_timestamptz(value: str) -> str:
-    if value.endswith("Z") or "+" in value[10:] or "-" in value[10:]:
-        return value
-    return f"{value}:00+07:00" if len(value) == 16 else f"{value}+07:00"
+def parse_open_meteo_time(value: str, timezone_name: str) -> datetime:
+    normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    city_timezone = ZoneInfo(timezone_name)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=city_timezone)
+    return parsed.astimezone(city_timezone)
+
+
+def local_open_meteo_time_to_timestamptz(value: str, timezone_name: str) -> str:
+    return parse_open_meteo_time(value, timezone_name).isoformat()
 
 
 def request_json(url: str, params: dict[str, Any]) -> Any:
@@ -167,23 +175,78 @@ def normalize_batch_response(response_json: Any, expected_count: int, source: st
     return responses
 
 
-def latest_hourly_row(payload: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+def selected_hourly_index(
+    payload: dict[str, Any],
+    fields: list[str],
+    timezone_name: str,
+    now: datetime,
+) -> int:
     hourly = payload.get("hourly") or {}
     times = hourly.get("time") or []
     if not times:
         raise RuntimeError("Open-Meteo hourly response did not include time values")
 
-    selected_index = None
-    for index in range(len(times) - 1, -1, -1):
-        if any(
+    city_timezone = ZoneInfo(timezone_name)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=city_timezone)
+    else:
+        now = now.astimezone(city_timezone)
+
+    latest_past_index: int | None = None
+    latest_past_time: datetime | None = None
+    closest_index: int | None = None
+    closest_time: datetime | None = None
+    closest_distance: float | None = None
+
+    for index, raw_time in enumerate(times):
+        has_value = any(
             index < len(hourly.get(field) or [])
             and (hourly.get(field) or [])[index] is not None
             for field in fields
-        ):
-            selected_index = index
-            break
+        )
+        if not has_value:
+            continue
 
-    if selected_index is None:
+        try:
+            observed_time = parse_open_meteo_time(str(raw_time), timezone_name)
+        except ValueError:
+            continue
+
+        if observed_time <= now and (
+            latest_past_time is None or observed_time > latest_past_time
+        ):
+            latest_past_index = index
+            latest_past_time = observed_time
+
+        distance = abs((observed_time - now).total_seconds())
+        if closest_distance is None or distance < closest_distance or (
+            distance == closest_distance
+            and closest_time is not None
+            and observed_time < closest_time
+        ):
+            closest_index = index
+            closest_time = observed_time
+            closest_distance = distance
+
+    if latest_past_index is not None:
+        return latest_past_index
+    if closest_index is not None:
+        return closest_index
+
+    raise RuntimeError("Open-Meteo hourly response did not include usable values near current time")
+
+
+def current_hourly_row(
+    payload: dict[str, Any],
+    fields: list[str],
+    timezone_name: str,
+    now: datetime,
+) -> dict[str, Any]:
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    selected_index = selected_hourly_index(payload, fields, timezone_name, now)
+
+    if selected_index >= len(times):
         raise RuntimeError("Open-Meteo hourly response did not include usable values")
 
     row: dict[str, Any] = {"time": times[selected_index]}
@@ -335,7 +398,6 @@ def fetch_batch_payloads(
         {
             "latitude": latitudes,
             "longitude": longitudes,
-            "current": ",".join(WEATHER_CURRENT_FIELDS),
             "hourly": ",".join(WEATHER_HOURLY_FIELDS),
             "timezone": timezone_name,
             "forecast_days": 1,
@@ -352,10 +414,11 @@ def build_observation_from_payloads(
     district: dict[str, Any],
     air_quality: dict[str, Any],
     weather: dict[str, Any],
+    timezone_name: str,
+    now: datetime,
 ) -> dict[str, Any]:
-    air_row = latest_hourly_row(air_quality, AIR_QUALITY_FIELDS)
-    weather_current = weather.get("current") or {}
-    precipitation_row = latest_hourly_row(weather, WEATHER_HOURLY_FIELDS)
+    air_row = current_hourly_row(air_quality, AIR_QUALITY_FIELDS, timezone_name, now)
+    weather_row = current_hourly_row(weather, WEATHER_HOURLY_FIELDS, timezone_name, now)
     pm25 = air_row.get("pm2_5")
     aqi = air_row.get("us_aqi")
     if aqi is None:
@@ -375,18 +438,18 @@ def build_observation_from_payloads(
         "so2": air_row.get("sulphur_dioxide"),
         "co": air_row.get("carbon_monoxide"),
         "uv_index": air_row.get("uv_index"),
-        "temperature": weather_current.get("temperature_2m"),
-        "humidity": weather_current.get("relative_humidity_2m"),
-        "precipitation_probability": precipitation_row.get("precipitation_probability"),
-        "wind_speed": weather_current.get("wind_speed_10m"),
-        "wind_gust": weather_current.get("wind_gusts_10m"),
-        "pressure": weather_current.get("pressure_msl"),
-        "cloud_cover": weather_current.get("cloud_cover"),
-        "weather_condition": weather_condition(weather_current.get("weather_code")),
+        "temperature": weather_row.get("temperature_2m"),
+        "humidity": weather_row.get("relative_humidity_2m"),
+        "precipitation_probability": weather_row.get("precipitation_probability"),
+        "wind_speed": weather_row.get("wind_speed_10m"),
+        "wind_gust": weather_row.get("wind_gusts_10m"),
+        "pressure": weather_row.get("pressure_msl"),
+        "cloud_cover": weather_row.get("cloud_cover"),
+        "weather_condition": weather_condition(weather_row.get("weather_code")),
         "status": status,
         "risk_level": risk_level,
         "recommendation": recommendation,
-        "measured_at": local_open_meteo_time_to_timestamptz(air_row["time"]),
+        "measured_at": local_open_meteo_time_to_timestamptz(air_row["time"], timezone_name),
         "updated_at": utc_now_iso(),
     }
 
@@ -396,9 +459,10 @@ def build_batch_observations(
     timezone_name: str,
 ) -> list[dict[str, Any]]:
     air_quality_payloads, weather_payloads = fetch_batch_payloads(districts, timezone_name)
+    now = datetime.now(ZoneInfo(timezone_name))
 
     return [
-        build_observation_from_payloads(district, air_quality, weather)
+        build_observation_from_payloads(district, air_quality, weather, timezone_name, now)
         for district, air_quality, weather in zip(
             districts,
             air_quality_payloads,
@@ -410,10 +474,13 @@ def build_batch_observations(
 
 def build_district_observation(district: dict[str, Any], timezone_name: str) -> dict[str, Any]:
     air_quality_payloads, weather_payloads = fetch_batch_payloads([district], timezone_name)
+    now = datetime.now(ZoneInfo(timezone_name))
     return build_observation_from_payloads(
         district,
         air_quality_payloads[0],
         weather_payloads[0],
+        timezone_name,
+        now,
     )
 
 
@@ -428,7 +495,7 @@ def main() -> int:
         getenv_required("SUPABASE_URL"),
         getenv_required("SUPABASE_SERVICE_ROLE_KEY"),
     )
-    timezone_name = os.getenv("CITY_TIMEZONE", "Asia/Bangkok")
+    timezone_name = os.getenv("CITY_TIMEZONE", DEFAULT_CITY_TIMEZONE)
     run_id = str(uuid.uuid4())
     started_at = utc_now_iso()
 

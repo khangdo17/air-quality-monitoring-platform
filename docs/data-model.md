@@ -11,6 +11,10 @@ Four tables:
 
 ## `air_quality_hourly`
 
+Column names deliberately match `district_air_weather_latest`
+(`aqi`, `pm25`, `pm10`, `no2`, `o3`), so the dashboard reads the same field
+name whether it is querying the snapshot or the history.
+
 Hourly air quality history. Primary key `(district, observed_at, source)`, so
 the same hour can hold both a Google row and a CAMS row without either
 overwriting the other.
@@ -20,8 +24,8 @@ overwriting the other.
 | `district` | text | District display name |
 | `observed_at` | timestamptz | Hour the values describe |
 | `source` | text | `google_aq` or `open_meteo_cams` (check constraint) |
-| `us_aqi` | int | US EPA AQI |
-| `pm2_5` | numeric | Fine particulate matter, µg/m³ |
+| `aqi` | int | US EPA AQI |
+| `pm25` | numeric | Fine particulate matter, µg/m³ |
 | `pm10` | numeric | Coarse particulate matter, µg/m³ |
 | `no2` | numeric | Nitrogen dioxide, µg/m³ |
 | `o3` | numeric | Ozone, µg/m³ |
@@ -66,19 +70,23 @@ stored.
 ## `weather_hourly`
 
 Hourly weather history from Open-Meteo. Primary key `(district, observed_at)`.
+Column names match `district_air_weather_latest` (`temperature`, `humidity`,
+`wind_speed`, `wind_gust`) rather than the Open-Meteo field names they are
+read from (`temperature_2m`, `relative_humidity_2m`, `wind_speed_10m`,
+`wind_gusts_10m`).
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `district` | text | District display name |
 | `observed_at` | timestamptz | Hour the values describe |
-| `temperature_2m` | numeric | Air temperature at 2 m, °C |
+| `temperature` | numeric | Air temperature at 2 m, °C |
 | `apparent_temperature` | numeric | Feels-like temperature, °C |
-| `relative_humidity_2m` | numeric | Relative humidity, % |
+| `humidity` | numeric | Relative humidity, % |
 | `precipitation` | numeric | Total precipitation, mm |
 | `rain` | numeric | Rain only, mm |
 | `precipitation_probability` | numeric | Probability of precipitation, % |
-| `wind_speed_10m` | numeric | Wind speed at 10 m |
-| `wind_gusts_10m` | numeric | Wind gust speed at 10 m |
+| `wind_speed` | numeric | Wind speed at 10 m |
+| `wind_gust` | numeric | Wind gust speed at 10 m |
 | `weather_code` | int | WMO weather code |
 | `ingested_at` | timestamptz | Pipeline write timestamp |
 

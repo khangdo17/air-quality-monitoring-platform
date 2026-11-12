@@ -51,9 +51,10 @@ The primary air quality source, at roughly 500 m resolution. Only
 [attribution-and-terms.md](attribution-and-terms.md): historic values may be
 stored, current and forecast values may not be held beyond an hour.
 
-Called on even hours, once per district, asking for the last 2 hours. With a
-2-hour cadence and a 2-hour window, every hour of the day is covered with no
-gap, at 18 calls per run and ~6,480 calls per month.
+Called on even hours, once per district, asking for the last 4 hours. The
+window is double the cadence so that a cron run GitHub never fires costs no
+data: the runs either side already cover its hours. Still 18 calls per run and
+~6,480 calls per month, because one district-run is one page either way.
 
 The key is sent in the `X-Goog-Api-Key` header and scrubbed from any error text
 the script logs or stores.
@@ -84,7 +85,7 @@ Each run:
 1. Loads environment variables and opens a pipeline run row.
 2. Fetches Open-Meteo air quality and weather for all 18 districts, batched.
 3. On even hours with a key present, calls Google `history:lookup` once per
-   district for the last 2 hours.
+   district for the last 4 hours.
 4. Writes every weather hour at or before the current hour to `weather_hourly`.
 5. Writes Google hours to `air_quality_hourly` as `google_aq`; writes CAMS
    hours as `open_meteo_cams` only where Google did not supply the district.

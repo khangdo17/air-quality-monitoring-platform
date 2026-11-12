@@ -107,6 +107,8 @@ the frontend shows the matching attribution.
 | Price beyond the free tier | $5.00 per 1,000 calls (first paid band) |
 | Daily quota cap | 300 |
 
-The history endpoint is billed **per response page**. The script requests
-`hours: 2` with `pageSize: 2` and never follows `nextPageToken`, so one
-district-run is always exactly one billable call.
+The history endpoint is billed **per response page**, not per hour returned.
+The script requests `hours: 4` with `pageSize: 4` and never follows
+`nextPageToken`, so one district-run is always exactly one billable call. The
+4-hour window therefore costs the same as a 1-hour window would, and exists so
+that a cron run GitHub never fires leaves no gap in the history.

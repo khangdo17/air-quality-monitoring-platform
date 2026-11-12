@@ -32,8 +32,8 @@ Request body per district:
 ```json
 {
   "location": { "latitude": 10.7757, "longitude": 106.7004 },
-  "hours": 2,
-  "pageSize": 2,
+  "hours": 4,
+  "pageSize": 4,
   "universalAqi": false,
   "extraComputations": ["LOCAL_AQI", "POLLUTANT_CONCENTRATION"],
   "customLocalAqis": [{ "regionCode": "VN", "aqi": "usa_epa" }],
@@ -41,22 +41,26 @@ Request body per district:
 }
 ```
 
-- `hours: 2` with a run every 2 hours covers all 24 hours with no gaps.
+- `hours: 4` with a run every 2 hours covers all 24 hours twice over. The
+  window is double the cadence on purpose: if one scheduled run never fires,
+  the runs either side still cover every hour it would have stored. A 2-hour
+  window would lose 2 hours and a 3-hour window would lose 1.
 - `customLocalAqis` requests the US EPA index (`usa_epa`) for a Vietnamese
   location, which keeps the dashboard's AQI scale unchanged from the previous
   Open-Meteo `us_aqi` field. `universalAqi` is off because the dashboard does
   not display Google's universal index.
-- `pageSize: 2` keeps the response to a single page. History is billed per
-  page and the script never follows `nextPageToken`, so one district-run is
-  always exactly one billable call.
+- `pageSize: 4` keeps the response to a single page: the default page size is
+  72 and the maximum is 168, so a 4-hour window is never split. History is
+  billed per page and the script never follows `nextPageToken`, so one
+  district-run is exactly one billable call whatever the window size.
 
 Values read from each `hoursInfo[]` entry:
 
 | Response path | Stored as |
 | --- | --- |
 | `dateTime` | `air_quality_hourly.observed_at` |
-| `indexes[code = "usa_epa"].aqi` | `us_aqi` |
-| `pollutants[code = "pm25"].concentration` | `pm2_5` |
+| `indexes[code = "usa_epa"].aqi` | `aqi` |
+| `pollutants[code = "pm25"].concentration` | `pm25` |
 | `pollutants[code = "pm10"].concentration` | `pm10` |
 | `pollutants[code = "no2"].concentration` | `no2` |
 | `pollutants[code = "o3"].concentration` | `o3` |

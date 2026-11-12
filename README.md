@@ -76,7 +76,7 @@ See [docs/architecture.md](docs/architecture.md).
 2. Fetches Open-Meteo air quality and weather for 18 districts, batched six
    per request.
 3. On **even hours**, calls Google `history:lookup` once per district for the
-   last 2 hours.
+   last 4 hours.
 4. Upserts every weather hour at or before the current hour into
    `weather_hourly`.
 5. Upserts Google hours into `air_quality_hourly` as `google_aq`, falling back
@@ -86,7 +86,11 @@ See [docs/architecture.md](docs/architecture.md).
 7. Records per-source status and API call counts in
    `air_quality_pipeline_runs`.
 
-A 2-hour cadence asking for a 2-hour window covers all 24 hours with no gaps.
+The 4-hour window is double the 2-hour cadence on purpose: GitHub Actions cron
+is best-effort, and a doubled window means a run that never fires loses no
+hours, since the runs either side already cover them. It costs nothing extra —
+one district-run is a single response page, and therefore a single billable
+call, at any of these window sizes.
 
 ## Terms, Attribution and Cost
 

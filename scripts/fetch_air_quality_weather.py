@@ -58,11 +58,20 @@ UPSERT_CHUNK_SIZE = 500
 # Google is called every N hours. Each call asks for GOOGLE_HISTORY_HOURS hours,
 # so consecutive runs cover every hour without gaps.
 #   18 districts x (24 / 2) runs x 30 days = 6,480 calls/month.
-# The Air Quality API free tier is 10,000 calls/month across every method, and
-# history is billed per response page, so the script never follows
-# nextPageToken: one district-run is always exactly one billed call.
+# The window must be at least 2x the cadence to survive a missed cron run.
+# A run at hour R stores hours R-1 .. R-GOOGLE_HISTORY_HOURS. If the run at R
+# never fires, its hours have to be covered by its neighbours at R-2 and R+2:
+#   window 2 -> R-1, R-2 lost      window 3 -> R-2 lost
+#   window 4 -> nothing lost (R+2 covers R-1, R-2; R-2 covers R-3, R-4)
+# GitHub Actions cron is best-effort, so 4 it is.
+#
+# The window does not change the price. The Air Quality API free tier is 10,000
+# calls/month across every method and history is billed per response page;
+# GOOGLE_PAGE_SIZE >= GOOGLE_HISTORY_HOURS keeps the response to a single page
+# and nextPageToken is never followed, so one district-run is always exactly
+# one billed call whatever the window.
 GOOGLE_RUN_EVERY_HOURS = 2
-GOOGLE_HISTORY_HOURS = 2
+GOOGLE_HISTORY_HOURS = 4
 GOOGLE_PAGE_SIZE = GOOGLE_HISTORY_HOURS
 GOOGLE_REGION_CODE = "VN"
 GOOGLE_LOCAL_AQI_CODE = "usa_epa"
@@ -75,8 +84,8 @@ SOURCE_CAMS = "open_meteo_cams"
 # The reference "Reported pollutants" table spells fine particulate matter
 # ``p25`` while the local-AQI pages use ``pm25``. Accept both.
 GOOGLE_POLLUTANT_CODES = {
-    "pm25": "pm2_5",
-    "p25": "pm2_5",
+    "pm25": "pm25",
+    "p25": "pm25",
     "pm10": "pm10",
     "no2": "no2",
     "o3": "o3",
@@ -645,8 +654,8 @@ def parse_google_hour(district_name: str, hour_info: dict[str, Any]) -> dict[str
         "district": district_name,
         "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
         "source": SOURCE_GOOGLE,
-        "us_aqi": us_aqi,
-        "pm2_5": None,
+        "aqi": us_aqi,
+        "pm25": None,
         "pm10": None,
         "no2": None,
         "o3": None,
@@ -664,10 +673,10 @@ def parse_google_hour(district_name: str, hour_info: dict[str, Any]) -> dict[str
             continue
         row[column] = google_concentration_to_ug_per_m3(code, concentration)
 
-    if us_aqi is None and row["pm2_5"] is not None:
-        row["us_aqi"] = calculate_us_aqi_from_pm25(row["pm2_5"])
+    if us_aqi is None and row["pm25"] is not None:
+        row["aqi"] = calculate_us_aqi_from_pm25(row["pm25"])
 
-    if all(row[field] is None for field in ("us_aqi", "pm2_5", "pm10", "no2", "o3")):
+    if all(row[field] is None for field in ("aqi", "pm25", "pm10", "no2", "o3")):
         return None
 
     return row
@@ -736,8 +745,8 @@ def build_cams_hourly_rows(
                 "district": district["district"],
                 "observed_at": observed_at.isoformat(),
                 "source": SOURCE_CAMS,
-                "us_aqi": int(us_aqi) if us_aqi is not None else None,
-                "pm2_5": values.get("pm2_5"),
+                "aqi": int(us_aqi) if us_aqi is not None else None,
+                "pm25": values.get("pm2_5"),
                 "pm10": values.get("pm10"),
                 "no2": values.get("nitrogen_dioxide"),
                 "o3": values.get("ozone"),
@@ -761,14 +770,14 @@ def build_weather_hourly_rows(
             {
                 "district": district["district"],
                 "observed_at": observed_at.isoformat(),
-                "temperature_2m": values.get("temperature_2m"),
+                "temperature": values.get("temperature_2m"),
                 "apparent_temperature": values.get("apparent_temperature"),
-                "relative_humidity_2m": values.get("relative_humidity_2m"),
+                "humidity": values.get("relative_humidity_2m"),
                 "precipitation": values.get("precipitation"),
                 "rain": values.get("rain"),
                 "precipitation_probability": values.get("precipitation_probability"),
-                "wind_speed_10m": values.get("wind_speed_10m"),
-                "wind_gusts_10m": values.get("wind_gusts_10m"),
+                "wind_speed": values.get("wind_speed_10m"),
+                "wind_gust": values.get("wind_gusts_10m"),
                 "weather_code": int(weather_code) if weather_code is not None else None,
             }
         )
@@ -807,8 +816,8 @@ def build_latest_row(
         cams_row = {}
 
     if air_quality_row is not None:
-        aqi = air_quality_row.get("us_aqi")
-        pm25 = air_quality_row.get("pm2_5")
+        aqi = air_quality_row.get("aqi")
+        pm25 = air_quality_row.get("pm25")
         pm10 = air_quality_row.get("pm10")
         no2 = air_quality_row.get("no2")
         o3 = air_quality_row.get("o3")
@@ -921,7 +930,7 @@ def fetch_recent_stored_air_quality(
         "GET",
         "air_quality_hourly",
         params={
-            "select": "district,observed_at,source,us_aqi,pm2_5,pm10,no2,o3",
+            "select": "district,observed_at,source,aqi,pm25,pm10,no2,o3",
             "observed_at": f"gte.{since}",
             "order": "observed_at.desc",
         },

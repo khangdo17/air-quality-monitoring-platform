@@ -13,6 +13,13 @@
 -- Only values fetched from history:lookup are written here. The pipeline never
 -- calls currentConditions:lookup, so nothing in this table is subject to the
 -- one-hour deletion rule.
+--
+-- NOTE (2026-11-12): the Google source is currently SWITCHED OFF
+-- (GOOGLE_AQ_ENABLED defaults to false). Terms of Service 3.2.3(e) forbids
+-- using a Core Service "with or near a non-Google Map" and /air-quality uses a
+-- custom Three.js map. The 'google_aq' source stays in the check constraint on
+-- purpose: the schema is ready if the switch is ever turned on, and any rows
+-- already stored remain storable. See docs/attribution-and-terms.md.
 
 create table if not exists air_quality_hourly (
   district text not null,

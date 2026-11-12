@@ -153,7 +153,7 @@ One row per ingestion execution.
 | `rows_failed` | int | Number of failed stages |
 | `error_message` | text | Failure detail, or JSON list of per-stage failures |
 | `air_quality_source` | text | `google_aq`, `open_meteo_cams`, `mixed`, or null |
-| `google_status` | text | `success`, `partial_success`, `failed`, `skipped`, `disabled` |
+| `google_status` | text | `success`, `partial_success`, `failed`, `skipped`, `unconfigured`, `disabled` |
 | `google_api_calls` | int | Billable Air Quality API calls this run |
 | `open_meteo_status` | text | `success`, `partial_success`, or `failed` |
 | `open_meteo_api_calls` | int | Open-Meteo HTTP attempts this run |
@@ -164,7 +164,9 @@ One row per ingestion execution.
 
 `google_status` distinguishes the states that look alike from the outside:
 
-- `disabled` — no `GOOGLE_MAPS_API_KEY`, or mode `never`. CAMS is the source.
+- `disabled` — `GOOGLE_AQ_ENABLED` is not `true`, or mode is `never`. Nothing
+  was called, whether or not a key exists. **This is the current state.**
+- `unconfigured` — the switch is on but no `GOOGLE_MAPS_API_KEY` was found.
 - `skipped` — key present, but this is an odd hour. Nothing was called.
 - `failed` — calls were made and all failed. CAMS filled in.
 - `partial_success` — some districts succeeded; the rest fell back to CAMS.

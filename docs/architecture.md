@@ -75,8 +75,16 @@ The workflow runs hourly at minute 7 and can be triggered manually with
 `workflow_dispatch`. It previously ran every 15 minutes, which mostly re-fetched
 an unchanged CAMS forecast.
 
-`GOOGLE_MAPS_API_KEY` is optional. Without it the pipeline runs on Open-Meteo
-alone and the dashboard keeps working at CAMS resolution.
+`GOOGLE_AQ_ENABLED` is the master switch for the Google Air Quality API and
+defaults to `false`. While it is off the pipeline never calls Google — a key in
+`GOOGLE_MAPS_API_KEY` is ignored — and runs on Open-Meteo alone at CAMS
+resolution. It is off because Google Maps Platform Terms of Service 3.2.3(e)
+forbids using a Core Service "with or near a non-Google Map" and `/air-quality`
+renders a custom Three.js map; see
+[attribution-and-terms.md](attribution-and-terms.md).
+
+`GOOGLE_MAPS_API_KEY` is optional even when the switch is on; without it the
+run records `google_status = 'unconfigured'` and falls back to CAMS.
 
 ### Python Ingestion
 
@@ -84,8 +92,9 @@ Each run:
 
 1. Loads environment variables and opens a pipeline run row.
 2. Fetches Open-Meteo air quality and weather for all 18 districts, batched.
-3. On even hours with a key present, calls Google `history:lookup` once per
-   district for the last 4 hours.
+3. If `GOOGLE_AQ_ENABLED=true`, on even hours with a key present, calls Google
+   `history:lookup` once per district for the last 4 hours. Off by default, so
+   today this step is skipped and the run records `google_status = 'disabled'`.
 4. Writes every weather hour at or before the current hour to `weather_hourly`.
 5. Writes Google hours to `air_quality_hourly` as `google_aq`; writes CAMS
    hours as `open_meteo_cams` only where Google did not supply the district.

@@ -194,6 +194,31 @@ def getenv_required(name: str) -> str:
     return value
 
 
+TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable. Anything unrecognised is False."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in TRUE_VALUES
+
+
+def google_air_quality_enabled() -> bool:
+    """Master switch for every call to the Google Air Quality API.
+
+    Defaults to FALSE. See docs/attribution-and-terms.md: Google Maps Platform
+    Terms of Service 3.2.3(e) (No Use With Non-Google Maps) forbids using a
+    Google Maps Core Service "with or near a non-Google Map", and the Air
+    Quality API is listed as a Core Service. The /air-quality dashboard renders
+    districts on a custom Three.js map, so Google stays off until that is
+    resolved. Setting GOOGLE_AQ_ENABLED=true is an explicit decision to accept
+    that reading, not a default.
+    """
+    return env_flag("GOOGLE_AQ_ENABLED", default=False)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -574,6 +599,13 @@ def google_history_request(api_key: str, body: dict[str, Any]) -> dict[str, Any]
     """POST history:lookup with retries. Counts every attempt as a billed call."""
     global GOOGLE_API_CALLS
 
+    # Belt and braces. The scheduler already gates this, but no code path may
+    # reach Google while the switch is off, key or no key.
+    if not google_air_quality_enabled():
+        raise RuntimeError(
+            "Refusing to call the Google Air Quality API: GOOGLE_AQ_ENABLED is not set"
+        )
+
     max_attempts = len(RETRY_BACKOFF_SECONDS) + 1
     headers = {
         "Content-Type": "application/json",
@@ -943,18 +975,32 @@ def fetch_recent_stored_air_quality(
     return grouped
 
 
-def google_schedule_state(now: datetime, api_key: str | None) -> tuple[bool, bool, str]:
-    """Return (configured, scheduled_now, mode)."""
+def google_air_quality_state(
+    now: datetime, api_key: str | None
+) -> tuple[bool, bool, str, str]:
+    """Return (enabled, scheduled_now, mode, status).
+
+    `status` is what lands in air_quality_pipeline_runs.google_status:
+      disabled     the GOOGLE_AQ_ENABLED switch is off, or mode is 'never'
+      unconfigured the switch is on but no GOOGLE_MAPS_API_KEY is present
+      scheduled    Google will be called this run
+      skipped      enabled and configured, but this is not a Google hour
+    'success' / 'partial_success' / 'failed' replace 'scheduled' afterwards.
+    """
     mode = (os.getenv("GOOGLE_AIR_QUALITY_MODE") or "auto").strip().lower()
     if mode not in {"auto", "always", "never"}:
         mode = "auto"
 
-    configured = bool(api_key) and mode != "never"
-    if not configured:
-        return False, False, mode
+    # The switch wins over everything, including a configured key.
+    if not google_air_quality_enabled() or mode == "never":
+        return False, False, mode, "disabled"
+    if not api_key:
+        return False, False, mode, "unconfigured"
     if mode == "always":
-        return True, True, mode
-    return True, now.hour % GOOGLE_RUN_EVERY_HOURS == 0, mode
+        return True, True, mode, "scheduled"
+    if now.hour % GOOGLE_RUN_EVERY_HOURS == 0:
+        return True, True, mode, "scheduled"
+    return True, False, mode, "skipped"
 
 
 def main() -> int:
@@ -997,8 +1043,8 @@ def main() -> int:
 
     try:
         now = datetime.now(ZoneInfo(timezone_name))
-        google_configured, google_scheduled, google_mode = google_schedule_state(
-            now, google_api_key
+        google_enabled, google_scheduled, google_mode, google_status = (
+            google_air_quality_state(now, google_api_key)
         )
 
         payloads = collect_open_meteo_payloads(timezone_name, failures)
@@ -1035,10 +1081,6 @@ def main() -> int:
             else:
                 google_status = "failed"
                 google_error = "Google history returned no usable rows for any district"
-        elif google_configured:
-            google_status = "skipped"
-        else:
-            google_status = "disabled"
 
         for district in HCM_DISTRICTS:
             name = district["district"]
@@ -1060,10 +1102,12 @@ def main() -> int:
                     {"district": name, "stage": "weather_hourly", "error": scrub(str(exc))}
                 )
 
-            # CAMS air quality is stored only as a fallback: when Google is not
-            # configured at all, or when its call for this district failed.
+            # CAMS air quality is stored only as a fallback: when Google is
+            # switched off or unconfigured, or when its call for this district
+            # failed. On an enabled odd hour the latest row is rebuilt from the
+            # rows already stored, so CAMS must not overwrite Google values.
             needs_cams_fallback = not district_air_rows and (
-                not google_configured or google_status in {"failed", "partial_success"}
+                not google_enabled or google_status in {"failed", "partial_success"}
             )
             if needs_cams_fallback:
                 try:
@@ -1169,6 +1213,7 @@ def main() -> int:
                     "rows_failed": len(failures),
                     "failures": failures,
                     "air_quality_source": air_quality_source,
+                    "google_enabled": google_enabled,
                     "google_mode": google_mode,
                     "google_status": google_status,
                     "google_error": google_error,

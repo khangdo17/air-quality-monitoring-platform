@@ -24,7 +24,8 @@ It demonstrates:
 
 - Scheduled data ingestion with GitHub Actions
 - A primary/fallback source strategy with per-source observability
-- API integration with the Google Air Quality API and Open-Meteo
+- API integration with Open-Meteo, and with the Google Air Quality API
+  (implemented, currently disabled — see Data Sources)
 - Working inside a commercial API's caching terms and free tier
 - PostgreSQL schema design for both a dashboard snapshot and hourly history
 - Supabase REST upserts with service-role writes
@@ -35,9 +36,19 @@ It demonstrates:
 
 | Source | Used for | Resolution | Update frequency | Key required |
 | --- | --- | --- | --- | --- |
-| Google Air Quality API (`history:lookup`) | Primary air quality | ~500 m | Hourly | Yes |
+| Google Air Quality API (`history:lookup`) | Primary air quality — **currently disabled** | ~500 m | Hourly | Yes |
 | Open-Meteo Air Quality (CAMS global) | Air quality fallback, SO2/CO/UV | ~25-45 km, 3-hourly steps | ~2x daily | No |
 | Open-Meteo Forecast | Weather | ~1-11 km | Hourly | No |
+
+> **Google is switched off.** `GOOGLE_AQ_ENABLED` defaults to `false`, so the
+> pipeline currently runs on Open-Meteo CAMS alone. Google Maps Platform Terms
+> of Service 3.2.3(e) forbids using a Core Service "with or near a non-Google
+> Map", and `/air-quality` uses a custom Three.js map. See
+> [docs/attribution-and-terms.md](docs/attribution-and-terms.md) for the clause,
+> the options and what the dashboard would need first.
+
+The Google integration is built and tested; it is off by policy, not by
+omission. The rest of this section describes it as designed.
 
 Air quality moved to Google because CAMS global resolves Ho Chi Minh City into
 roughly one or two grid cells. All 18 districts therefore reported nearly
@@ -45,7 +56,8 @@ identical values, and a district-level map had little district-level signal to
 show. At ~500 m the districts genuinely differ.
 
 Open-Meteo remains the weather source and the air quality fallback. **Without
-`GOOGLE_MAPS_API_KEY` the pipeline still runs end to end** on Open-Meteo alone.
+`GOOGLE_AQ_ENABLED=true` the pipeline still runs end to end** on Open-Meteo
+alone — which is the current configuration.
 
 ## Architecture
 

@@ -3,9 +3,9 @@ name: Update Air Quality Data
 on:
   schedule:
     # Hourly. Open-Meteo CAMS publishes 3-hourly steps twice a day, and the
-    # Google Air Quality API is called only on even hours (see the script), so
-    # a tighter schedule would re-fetch the same values and burn free-tier
-    # calls for nothing.
+    # Google Air Quality API (when enabled) is called only on even hours, so a
+    # tighter schedule would re-fetch the same values and burn free-tier calls
+    # for nothing.
     - cron: "7 * * * *"
   workflow_dispatch:
 
@@ -34,7 +34,13 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # Optional. Without it the pipeline runs on Open-Meteo CAMS alone.
+          # Google Air Quality is OFF. Terms of Service 3.2.3(e) forbids
+          # using a Core Service "with or near a non-Google Map" and
+          # /air-quality uses a custom Three.js map. See
+          # docs/attribution-and-terms.md before changing this to "true";
+          # the dashboard needs Google's attribution built first.
+          GOOGLE_AQ_ENABLED: "false"
+          # Ignored while the switch above is "false". No call is made.
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           CITY_TIMEZONE: Asia/Bangkok
         run: python scripts/fetch_air_quality_weather.py

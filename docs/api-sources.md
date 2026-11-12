@@ -4,9 +4,16 @@
 
 | Source | Used for | Resolution | Update frequency | Called |
 | --- | --- | --- | --- | --- |
-| Google Air Quality API (`history:lookup`) | Primary air quality | ~500 m | Hourly | Even hours, 18 calls/run |
+| Google Air Quality API (`history:lookup`) | Primary air quality | ~500 m | Hourly | **Never — disabled.** When enabled: even hours, 18 calls/run |
 | Open-Meteo Air Quality API (CAMS global) | Air quality fallback, plus SO2/CO/UV | ~25-45 km, 3-hourly steps | Twice daily | Every run, 1 batched call per 6 districts |
 | Open-Meteo Forecast API | Weather | ~1-11 km | Hourly | Every run, 1 batched call per 6 districts |
+
+> **Google is switched off.** `GOOGLE_AQ_ENABLED` defaults to `false`, so the
+> pipeline currently runs on Open-Meteo CAMS alone. Google Maps Platform Terms
+> of Service 3.2.3(e) forbids using a Core Service "with or near a non-Google
+> Map", and `/air-quality` uses a custom Three.js map. See
+> [attribution-and-terms.md](attribution-and-terms.md). Everything below
+> describes the integration as built; it is simply not being called.
 
 The resolution difference is the reason for the migration. On a 25-45 km CAMS
 grid, all 18 Ho Chi Minh City districts fall into roughly one or two cells, so

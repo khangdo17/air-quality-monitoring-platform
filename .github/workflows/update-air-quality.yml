@@ -2,7 +2,11 @@ name: Update Air Quality Data
 
 on:
   schedule:
-    - cron: "7/15 * * * *"
+    # Hourly. Open-Meteo CAMS publishes 3-hourly steps twice a day, and the
+    # Google Air Quality API is called only on even hours (see the script), so
+    # a tighter schedule would re-fetch the same values and burn free-tier
+    # calls for nothing.
+    - cron: "7 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -30,5 +34,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional. Without it the pipeline runs on Open-Meteo CAMS alone.
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           CITY_TIMEZONE: Asia/Bangkok
         run: python scripts/fetch_air_quality_weather.py

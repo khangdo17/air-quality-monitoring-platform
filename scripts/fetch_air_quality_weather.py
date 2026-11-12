@@ -2,11 +2,28 @@
 """Fetch district-level Ho Chi Minh City air quality and weather data.
 
 Data sources:
-- Open-Meteo Air Quality API
-- Open-Meteo Forecast API
+- Google Air Quality API (history:lookup only) - primary air quality, ~500 m grid
+- Open-Meteo Air Quality API (CAMS global) - air quality fallback, ~25-45 km grid
+- Open-Meteo Forecast API - weather
 
-The script writes latest rows into Supabase PostgreSQL through the REST API.
-It expects Supabase credentials through environment variables or a local .env.
+The script writes hourly history into ``air_quality_hourly`` and
+``weather_hourly`` and keeps ``district_air_weather_latest`` in sync with the
+newest stored hour. It expects credentials through environment variables or a
+local .env.
+
+Licensing note
+--------------
+Google Maps Platform Service Specific Terms, Table 2.2.1 (Air Quality API
+Caching Permissions), last modified October 28, 2026:
+
+* "Current conditions values / Hourly forecast values" may be cached for
+  "One hour, after which Customer must delete the cached Google Maps Content".
+* "Historic values for a specific location and given time range" may be cached
+  "Until the Agreement is terminated".
+
+This script therefore calls ``history:lookup`` exclusively and never
+``currentConditions:lookup`` or ``forecast:lookup``. Everything persisted from
+Google is a historic value for a specific location and time range.
 """
 
 from __future__ import annotations
@@ -17,9 +34,9 @@ import random
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -28,13 +45,50 @@ import requests
 MIN_PYTHON = (3, 11)
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+GOOGLE_AIR_QUALITY_HISTORY_URL = "https://airquality.googleapis.com/v1/history:lookup"
+
 REQUEST_TIMEOUT = (10, 45)
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRY_BACKOFF_SECONDS = [2, 5, 10]
 BATCH_SIZE = 6
 BATCH_DELAY_SECONDS = 0.25
-API_REQUESTS_ATTEMPTED = 0
 DEFAULT_CITY_TIMEZONE = "Asia/Bangkok"
+UPSERT_CHUNK_SIZE = 500
+
+# Google is called every N hours. Each call asks for GOOGLE_HISTORY_HOURS hours,
+# so consecutive runs cover every hour without gaps.
+#   18 districts x (24 / 2) runs x 30 days = 6,480 calls/month.
+# The Air Quality API free tier is 10,000 calls/month across every method, and
+# history is billed per response page, so the script never follows
+# nextPageToken: one district-run is always exactly one billed call.
+GOOGLE_RUN_EVERY_HOURS = 2
+GOOGLE_HISTORY_HOURS = 2
+GOOGLE_PAGE_SIZE = GOOGLE_HISTORY_HOURS
+GOOGLE_REGION_CODE = "VN"
+GOOGLE_LOCAL_AQI_CODE = "usa_epa"
+GOOGLE_REQUEST_TIMEOUT = (10, 30)
+GOOGLE_CALL_DELAY_SECONDS = 0.1
+
+SOURCE_GOOGLE = "google_aq"
+SOURCE_CAMS = "open_meteo_cams"
+
+# The reference "Reported pollutants" table spells fine particulate matter
+# ``p25`` while the local-AQI pages use ``pm25``. Accept both.
+GOOGLE_POLLUTANT_CODES = {
+    "pm25": "pm2_5",
+    "p25": "pm2_5",
+    "pm10": "pm10",
+    "no2": "no2",
+    "o3": "o3",
+}
+
+# Google reports NO2 and O3 in ppb; CAMS reports ug/m3. Both are stored as
+# ug/m3 so the two sources share a column. Molar volume 24.45 L/mol at 25 C and
+# 1013.25 hPa: ug/m3 = ppb * molecular_weight / 24.45.
+PPB_TO_UG_PER_M3 = {
+    "no2": 46.0055 / 24.45,
+    "o3": 48.00 / 24.45,
+}
 
 AIR_QUALITY_FIELDS = [
     "pm10",
@@ -49,13 +103,29 @@ AIR_QUALITY_FIELDS = [
 
 WEATHER_HOURLY_FIELDS = [
     "temperature_2m",
+    "apparent_temperature",
     "relative_humidity_2m",
+    "precipitation",
+    "rain",
     "precipitation_probability",
     "weather_code",
     "cloud_cover",
     "pressure_msl",
     "wind_speed_10m",
     "wind_gusts_10m",
+]
+
+# Subset of WEATHER_HOURLY_FIELDS persisted to weather_hourly.
+WEATHER_HISTORY_FIELDS = [
+    "temperature_2m",
+    "apparent_temperature",
+    "relative_humidity_2m",
+    "precipitation",
+    "rain",
+    "precipitation_probability",
+    "wind_speed_10m",
+    "wind_gusts_10m",
+    "weather_code",
 ]
 
 HCM_DISTRICTS = [
@@ -78,6 +148,22 @@ HCM_DISTRICTS = [
     {"district": "Quận 7", "latitude": 10.7380, "longitude": 106.7218},
     {"district": "Phú Nhuận", "latitude": 10.7992, "longitude": 106.6803},
 ]
+
+API_REQUESTS_ATTEMPTED = 0
+GOOGLE_API_CALLS = 0
+_SECRETS: list[str] = []
+
+
+def register_secret(value: str | None) -> None:
+    if value and len(value) >= 8:
+        _SECRETS.append(value)
+
+
+def scrub(text: str) -> str:
+    """Remove credentials from anything written to logs or the database."""
+    for secret in _SECRETS:
+        text = text.replace(secret, "***")
+    return text
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -116,6 +202,18 @@ def local_open_meteo_time_to_timestamptz(value: str, timezone_name: str) -> str:
     return parse_open_meteo_time(value, timezone_name).isoformat()
 
 
+def parse_rfc3339(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def floor_to_hour(value: datetime) -> datetime:
+    return value.replace(minute=0, second=0, microsecond=0)
+
+
 def request_json(url: str, params: dict[str, Any]) -> Any:
     global API_REQUESTS_ATTEMPTED
 
@@ -132,21 +230,21 @@ def request_json(url: str, params: dict[str, Any]) -> Any:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt == max_attempts:
                 raise
-            sleep_before_retry(attempt, exc)
+            sleep_before_retry(attempt, exc, "Open-Meteo")
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             if status_code not in RETRY_STATUS_CODES or attempt == max_attempts:
                 raise
-            sleep_before_retry(attempt, exc)
+            sleep_before_retry(attempt, exc, "Open-Meteo")
 
     raise RuntimeError("Open-Meteo request failed after retries")
 
 
-def sleep_before_retry(attempt: int, exc: Exception) -> None:
+def sleep_before_retry(attempt: int, exc: Exception, source: str) -> None:
     base_delay = RETRY_BACKOFF_SECONDS[attempt - 1]
     delay = base_delay + random.uniform(0, 0.5)
     print(
-        f"Transient Open-Meteo request error on attempt {attempt}; "
+        f"Transient {source} request error on attempt {attempt}; "
         f"retrying in {delay:.1f}s ({exc.__class__.__name__}).",
         file=sys.stderr,
     )
@@ -254,6 +352,39 @@ def current_hourly_row(
         values = hourly.get(field) or []
         row[field] = values[selected_index] if selected_index < len(values) else None
     return row
+
+
+def iter_past_hourly_rows(
+    payload: dict[str, Any],
+    fields: list[str],
+    timezone_name: str,
+    now: datetime,
+) -> Iterable[tuple[datetime, dict[str, Any]]]:
+    """Yield every hourly row at or before the current hour.
+
+    Open-Meteo returns forecast hours alongside past ones. Future rows are
+    skipped so the history tables only ever hold observed/analysed hours.
+    """
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    cutoff = floor_to_hour(now.astimezone(ZoneInfo(timezone_name)))
+
+    for index, raw_time in enumerate(times):
+        try:
+            observed_at = parse_open_meteo_time(str(raw_time), timezone_name)
+        except ValueError:
+            continue
+        if observed_at > cutoff:
+            continue
+
+        values = {}
+        for field in fields:
+            column = hourly.get(field) or []
+            values[field] = column[index] if index < len(column) else None
+        if all(value is None for value in values.values()):
+            continue
+
+        yield observed_at, values
 
 
 def weather_condition(code: int | None) -> str:
@@ -369,6 +500,20 @@ class SupabaseRestClient:
         response.raise_for_status()
         return response.json() if response.text else None
 
+    def upsert(self, table: str, rows: list[dict[str, Any]], on_conflict: str) -> int:
+        written = 0
+        for start in range(0, len(rows), UPSERT_CHUNK_SIZE):
+            chunk = rows[start : start + UPSERT_CHUNK_SIZE]
+            self.request(
+                "POST",
+                table,
+                body=chunk,
+                params={"on_conflict": on_conflict},
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+            written += len(chunk)
+        return written
+
 
 def format_coordinate_list(districts: list[dict[str, Any]], key: str) -> str:
     return ",".join(f"{district[key]:.6f}" for district in districts)
@@ -401,6 +546,7 @@ def fetch_batch_payloads(
             "hourly": ",".join(WEATHER_HOURLY_FIELDS),
             "timezone": timezone_name,
             "forecast_days": 1,
+            "past_days": 1,
         },
     )
 
@@ -410,19 +556,277 @@ def fetch_batch_payloads(
     )
 
 
-def build_observation_from_payloads(
+# --------------------------------------------------------------------------- #
+# Google Air Quality API (history:lookup only)
+# --------------------------------------------------------------------------- #
+
+
+def google_history_request(api_key: str, body: dict[str, Any]) -> dict[str, Any]:
+    """POST history:lookup with retries. Counts every attempt as a billed call."""
+    global GOOGLE_API_CALLS
+
+    max_attempts = len(RETRY_BACKOFF_SECONDS) + 1
+    headers = {
+        "Content-Type": "application/json",
+        # Header form keeps the key out of request URLs and error strings.
+        "X-Goog-Api-Key": api_key,
+    }
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            GOOGLE_API_CALLS += 1
+            response = requests.post(
+                GOOGLE_AIR_QUALITY_HISTORY_URL,
+                headers=headers,
+                json=body,
+                timeout=GOOGLE_REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"Google history response had unexpected type: {type(payload).__name__}"
+                )
+            return payload
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt == max_attempts:
+                raise RuntimeError(f"Google history request failed: {exc.__class__.__name__}") from None
+            sleep_before_retry(attempt, exc, "Google Air Quality")
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            detail = ""
+            if exc.response is not None:
+                detail = scrub(exc.response.text or "")[:300]
+            if status_code not in RETRY_STATUS_CODES or attempt == max_attempts:
+                raise RuntimeError(
+                    f"Google history request failed with HTTP {status_code}: {detail}"
+                ) from None
+            sleep_before_retry(attempt, exc, "Google Air Quality")
+
+    raise RuntimeError("Google history request failed after retries")
+
+
+def google_concentration_to_ug_per_m3(code: str, concentration: dict[str, Any]) -> float | None:
+    value = concentration.get("value")
+    if value is None:
+        return None
+
+    units = str(concentration.get("units") or "").upper()
+    if units == "PARTS_PER_BILLION":
+        factor = PPB_TO_UG_PER_M3.get(code)
+        if factor is None:
+            # Unknown pollutant in ppb: no defensible conversion, drop it.
+            return None
+        return round(float(value) * factor, 3)
+    if units in {"MICROGRAMS_PER_CUBIC_METER", ""}:
+        return round(float(value), 3)
+    return None
+
+
+def parse_google_hour(district_name: str, hour_info: dict[str, Any]) -> dict[str, Any] | None:
+    raw_time = hour_info.get("dateTime")
+    if not raw_time:
+        return None
+    try:
+        observed_at = parse_rfc3339(str(raw_time))
+    except ValueError:
+        return None
+
+    us_aqi: int | None = None
+    for index in hour_info.get("indexes") or []:
+        if not isinstance(index, dict):
+            continue
+        if index.get("code") == GOOGLE_LOCAL_AQI_CODE:
+            raw_aqi = index.get("aqi")
+            us_aqi = int(raw_aqi) if isinstance(raw_aqi, (int, float)) else None
+            break
+
+    row: dict[str, Any] = {
+        "district": district_name,
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "source": SOURCE_GOOGLE,
+        "us_aqi": us_aqi,
+        "pm2_5": None,
+        "pm10": None,
+        "no2": None,
+        "o3": None,
+    }
+
+    for pollutant in hour_info.get("pollutants") or []:
+        if not isinstance(pollutant, dict):
+            continue
+        code = str(pollutant.get("code") or "").lower()
+        column = GOOGLE_POLLUTANT_CODES.get(code)
+        if column is None:
+            continue
+        concentration = pollutant.get("concentration")
+        if not isinstance(concentration, dict):
+            continue
+        row[column] = google_concentration_to_ug_per_m3(code, concentration)
+
+    if us_aqi is None and row["pm2_5"] is not None:
+        row["us_aqi"] = calculate_us_aqi_from_pm25(row["pm2_5"])
+
+    if all(row[field] is None for field in ("us_aqi", "pm2_5", "pm10", "no2", "o3")):
+        return None
+
+    return row
+
+
+def fetch_google_history(district: dict[str, Any], api_key: str) -> list[dict[str, Any]]:
+    """Return up to GOOGLE_HISTORY_HOURS hourly rows for one district.
+
+    Exactly one request per district: nextPageToken is deliberately ignored so a
+    run can never cost more calls than planned.
+    """
+    body = {
+        "location": {
+            "latitude": district["latitude"],
+            "longitude": district["longitude"],
+        },
+        "hours": GOOGLE_HISTORY_HOURS,
+        "pageSize": GOOGLE_PAGE_SIZE,
+        "universalAqi": False,
+        "extraComputations": ["LOCAL_AQI", "POLLUTANT_CONCENTRATION"],
+        "customLocalAqis": [
+            {"regionCode": GOOGLE_REGION_CODE, "aqi": GOOGLE_LOCAL_AQI_CODE}
+        ],
+        "languageCode": "en",
+    }
+
+    payload = google_history_request(api_key, body)
+    hours_info = payload.get("hoursInfo")
+    if not isinstance(hours_info, list) or not hours_info:
+        raise RuntimeError("Google history response did not include hoursInfo")
+
+    rows = []
+    for hour_info in hours_info:
+        if not isinstance(hour_info, dict):
+            continue
+        row = parse_google_hour(district["district"], hour_info)
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        raise RuntimeError("Google history response did not include usable hourly values")
+
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Row builders
+# --------------------------------------------------------------------------- #
+
+
+def build_cams_hourly_rows(
     district: dict[str, Any],
-    air_quality: dict[str, Any],
-    weather: dict[str, Any],
+    payload: dict[str, Any],
+    timezone_name: str,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    rows = []
+    for observed_at, values in iter_past_hourly_rows(
+        payload, AIR_QUALITY_FIELDS, timezone_name, now
+    ):
+        us_aqi = values.get("us_aqi")
+        if us_aqi is None:
+            us_aqi = calculate_us_aqi_from_pm25(values.get("pm2_5"))
+        rows.append(
+            {
+                "district": district["district"],
+                "observed_at": observed_at.isoformat(),
+                "source": SOURCE_CAMS,
+                "us_aqi": int(us_aqi) if us_aqi is not None else None,
+                "pm2_5": values.get("pm2_5"),
+                "pm10": values.get("pm10"),
+                "no2": values.get("nitrogen_dioxide"),
+                "o3": values.get("ozone"),
+            }
+        )
+    return rows
+
+
+def build_weather_hourly_rows(
+    district: dict[str, Any],
+    payload: dict[str, Any],
+    timezone_name: str,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    rows = []
+    for observed_at, values in iter_past_hourly_rows(
+        payload, WEATHER_HISTORY_FIELDS, timezone_name, now
+    ):
+        weather_code = values.get("weather_code")
+        rows.append(
+            {
+                "district": district["district"],
+                "observed_at": observed_at.isoformat(),
+                "temperature_2m": values.get("temperature_2m"),
+                "apparent_temperature": values.get("apparent_temperature"),
+                "relative_humidity_2m": values.get("relative_humidity_2m"),
+                "precipitation": values.get("precipitation"),
+                "rain": values.get("rain"),
+                "precipitation_probability": values.get("precipitation_probability"),
+                "wind_speed_10m": values.get("wind_speed_10m"),
+                "wind_gusts_10m": values.get("wind_gusts_10m"),
+                "weather_code": int(weather_code) if weather_code is not None else None,
+            }
+        )
+    return rows
+
+
+def newest_air_quality_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Newest stored hour for one district, preferring the Google source."""
+    if not rows:
+        return None
+
+    def sort_key(row: dict[str, Any]) -> tuple[datetime, int]:
+        return (
+            parse_rfc3339(row["observed_at"]),
+            1 if row["source"] == SOURCE_GOOGLE else 0,
+        )
+
+    return max(rows, key=sort_key)
+
+
+def build_latest_row(
+    district: dict[str, Any],
+    air_quality_row: dict[str, Any] | None,
+    cams_payload: dict[str, Any],
+    weather_payload: dict[str, Any],
     timezone_name: str,
     now: datetime,
 ) -> dict[str, Any]:
-    air_row = current_hourly_row(air_quality, AIR_QUALITY_FIELDS, timezone_name, now)
-    weather_row = current_hourly_row(weather, WEATHER_HOURLY_FIELDS, timezone_name, now)
-    pm25 = air_row.get("pm2_5")
-    aqi = air_row.get("us_aqi")
-    if aqi is None:
-        aqi = calculate_us_aqi_from_pm25(pm25)
+    weather_row = current_hourly_row(weather_payload, WEATHER_HOURLY_FIELDS, timezone_name, now)
+
+    # so2, co and uv_index are not part of the hourly history tables; they come
+    # from the Open-Meteo CAMS payload, which is fetched on every run.
+    try:
+        cams_row = current_hourly_row(cams_payload, AIR_QUALITY_FIELDS, timezone_name, now)
+    except RuntimeError:
+        cams_row = {}
+
+    if air_quality_row is not None:
+        aqi = air_quality_row.get("us_aqi")
+        pm25 = air_quality_row.get("pm2_5")
+        pm10 = air_quality_row.get("pm10")
+        no2 = air_quality_row.get("no2")
+        o3 = air_quality_row.get("o3")
+        measured_at = air_quality_row["observed_at"]
+        source = air_quality_row["source"]
+    else:
+        aqi = cams_row.get("us_aqi") or calculate_us_aqi_from_pm25(cams_row.get("pm2_5"))
+        pm25 = cams_row.get("pm2_5")
+        pm10 = cams_row.get("pm10")
+        no2 = cams_row.get("nitrogen_dioxide")
+        o3 = cams_row.get("ozone")
+        measured_at = (
+            local_open_meteo_time_to_timestamptz(cams_row["time"], timezone_name)
+            if cams_row.get("time")
+            else None
+        )
+        source = SOURCE_CAMS
+
     status, risk_level, recommendation = aqi_status(aqi)
 
     return {
@@ -432,12 +836,12 @@ def build_observation_from_payloads(
         "longitude": district["longitude"],
         "aqi": aqi,
         "pm25": pm25,
-        "pm10": air_row.get("pm10"),
-        "no2": air_row.get("nitrogen_dioxide"),
-        "o3": air_row.get("ozone"),
-        "so2": air_row.get("sulphur_dioxide"),
-        "co": air_row.get("carbon_monoxide"),
-        "uv_index": air_row.get("uv_index"),
+        "pm10": pm10,
+        "no2": no2,
+        "o3": o3,
+        "so2": cams_row.get("sulphur_dioxide"),
+        "co": cams_row.get("carbon_monoxide"),
+        "uv_index": cams_row.get("uv_index"),
         "temperature": weather_row.get("temperature_2m"),
         "humidity": weather_row.get("relative_humidity_2m"),
         "precipitation_probability": weather_row.get("precipitation_probability"),
@@ -449,39 +853,99 @@ def build_observation_from_payloads(
         "status": status,
         "risk_level": risk_level,
         "recommendation": recommendation,
-        "measured_at": local_open_meteo_time_to_timestamptz(air_row["time"], timezone_name),
+        "air_quality_source": source,
+        "measured_at": measured_at,
         "updated_at": utc_now_iso(),
     }
 
 
-def build_batch_observations(
-    districts: list[dict[str, Any]],
+def collect_open_meteo_payloads(
     timezone_name: str,
-) -> list[dict[str, Any]]:
-    air_quality_payloads, weather_payloads = fetch_batch_payloads(districts, timezone_name)
-    now = datetime.now(ZoneInfo(timezone_name))
+    failures: list[dict[str, str]],
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    """Fetch CAMS air quality and weather payloads for every district."""
+    payloads: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
 
-    return [
-        build_observation_from_payloads(district, air_quality, weather, timezone_name, now)
-        for district, air_quality, weather in zip(
-            districts,
-            air_quality_payloads,
-            weather_payloads,
-            strict=True,
-        )
-    ]
+    for batch_start in range(0, len(HCM_DISTRICTS), BATCH_SIZE):
+        district_batch = HCM_DISTRICTS[batch_start : batch_start + BATCH_SIZE]
+        batch_names = ", ".join(district["district"] for district in district_batch)
+        try:
+            air_quality_payloads, weather_payloads = fetch_batch_payloads(
+                district_batch, timezone_name
+            )
+            for district, air_quality, weather in zip(
+                district_batch, air_quality_payloads, weather_payloads, strict=True
+            ):
+                payloads[district["district"]] = (air_quality, weather)
+        except Exception as batch_exc:  # noqa: BLE001 - batch fallback preserves data availability.
+            print(
+                f"Batch request failed for [{batch_names}]; falling back to per-district requests "
+                f"({scrub(str(batch_exc))}).",
+                file=sys.stderr,
+            )
+            for district in district_batch:
+                try:
+                    air_quality_payloads, weather_payloads = fetch_batch_payloads(
+                        [district], timezone_name
+                    )
+                    payloads[district["district"]] = (
+                        air_quality_payloads[0],
+                        weather_payloads[0],
+                    )
+                except Exception as exc:  # noqa: BLE001 - record per-district failures.
+                    failures.append(
+                        {
+                            "district": district["district"],
+                            "stage": "open_meteo",
+                            "error": scrub(str(exc)),
+                        }
+                    )
+        time.sleep(BATCH_DELAY_SECONDS)
+
+    return payloads
 
 
-def build_district_observation(district: dict[str, Any], timezone_name: str) -> dict[str, Any]:
-    air_quality_payloads, weather_payloads = fetch_batch_payloads([district], timezone_name)
-    now = datetime.now(ZoneInfo(timezone_name))
-    return build_observation_from_payloads(
-        district,
-        air_quality_payloads[0],
-        weather_payloads[0],
-        timezone_name,
-        now,
+def fetch_recent_stored_air_quality(
+    supabase: SupabaseRestClient,
+    lookback_hours: int = 6,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read back the most recent stored hours so the latest table reflects them.
+
+    On hours when Google is not scheduled, nothing new is written to
+    air_quality_hourly. Without this read-back the latest row would fall back to
+    the coarse CAMS payload and overwrite the Google values, flipping the
+    dashboard source every other hour.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+    rows = supabase.request(
+        "GET",
+        "air_quality_hourly",
+        params={
+            "select": "district,observed_at,source,us_aqi,pm2_5,pm10,no2,o3",
+            "observed_at": f"gte.{since}",
+            "order": "observed_at.desc",
+        },
     )
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("district"):
+            grouped.setdefault(row["district"], []).append(row)
+    return grouped
+
+
+def google_schedule_state(now: datetime, api_key: str | None) -> tuple[bool, bool, str]:
+    """Return (configured, scheduled_now, mode)."""
+    mode = (os.getenv("GOOGLE_AIR_QUALITY_MODE") or "auto").strip().lower()
+    if mode not in {"auto", "always", "never"}:
+        mode = "auto"
+
+    configured = bool(api_key) and mode != "never"
+    if not configured:
+        return False, False, mode
+    if mode == "always":
+        return True, True, mode
+    return True, now.hour % GOOGLE_RUN_EVERY_HOURS == 0, mode
 
 
 def main() -> int:
@@ -491,10 +955,13 @@ def main() -> int:
     started_monotonic = time.monotonic()
     load_dotenv()
 
-    supabase = SupabaseRestClient(
-        getenv_required("SUPABASE_URL"),
-        getenv_required("SUPABASE_SERVICE_ROLE_KEY"),
-    )
+    supabase_url = getenv_required("SUPABASE_URL")
+    supabase_key = getenv_required("SUPABASE_SERVICE_ROLE_KEY")
+    google_api_key = os.getenv("GOOGLE_MAPS_API_KEY") or None
+    register_secret(supabase_key)
+    register_secret(google_api_key)
+
+    supabase = SupabaseRestClient(supabase_url, supabase_key)
     timezone_name = os.getenv("CITY_TIMEZONE", DEFAULT_CITY_TIMEZONE)
     run_id = str(uuid.uuid4())
     started_at = utc_now_iso()
@@ -512,61 +979,195 @@ def main() -> int:
         prefer="return=minimal",
     )
 
-    rows: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-
-    for batch_start in range(0, len(HCM_DISTRICTS), BATCH_SIZE):
-        district_batch = HCM_DISTRICTS[batch_start : batch_start + BATCH_SIZE]
-        batch_names = ", ".join(district["district"] for district in district_batch)
-        try:
-            rows.extend(build_batch_observations(district_batch, timezone_name))
-        except Exception as batch_exc:  # noqa: BLE001 - batch fallback preserves data availability.
-            print(
-                f"Batch request failed for [{batch_names}]; falling back to per-district requests "
-                f"({batch_exc}).",
-                file=sys.stderr,
-            )
-            for district in district_batch:
-                try:
-                    rows.append(build_district_observation(district, timezone_name))
-                except Exception as exc:  # noqa: BLE001 - record per-district failures for observability.
-                    failures.append({"district": district["district"], "error": str(exc)})
-        time.sleep(BATCH_DELAY_SECONDS)
+    weather_rows: list[dict[str, Any]] = []
+    air_quality_rows: list[dict[str, Any]] = []
+    latest_rows: list[dict[str, Any]] = []
+    google_status = "disabled"
+    google_error: str | None = None
 
     try:
-        if not rows:
-            raise RuntimeError("No district rows were fetched successfully")
-
-        supabase.request(
-            "POST",
-            "district_air_weather_latest",
-            body=rows,
-            params={"on_conflict": "district"},
-            prefer="resolution=merge-duplicates,return=minimal",
+        now = datetime.now(ZoneInfo(timezone_name))
+        google_configured, google_scheduled, google_mode = google_schedule_state(
+            now, google_api_key
         )
 
+        payloads = collect_open_meteo_payloads(timezone_name, failures)
+        open_meteo_status = "success" if payloads and not failures else (
+            "partial_success" if payloads else "failed"
+        )
+
+        # ------------------------------------------------------------------ #
+        # Air quality: Google history first, Open-Meteo CAMS as the fallback.
+        # ------------------------------------------------------------------ #
+        google_rows_by_district: dict[str, list[dict[str, Any]]] = {}
+
+        if google_scheduled and google_api_key:
+            google_failures = 0
+            for district in HCM_DISTRICTS:
+                try:
+                    rows = fetch_google_history(district, google_api_key)
+                    google_rows_by_district[district["district"]] = rows
+                except Exception as exc:  # noqa: BLE001 - per-district fallback to CAMS.
+                    google_failures += 1
+                    failures.append(
+                        {
+                            "district": district["district"],
+                            "stage": "google_air_quality",
+                            "error": scrub(str(exc)),
+                        }
+                    )
+                time.sleep(GOOGLE_CALL_DELAY_SECONDS)
+
+            if google_rows_by_district and google_failures == 0:
+                google_status = "success"
+            elif google_rows_by_district:
+                google_status = "partial_success"
+            else:
+                google_status = "failed"
+                google_error = "Google history returned no usable rows for any district"
+        elif google_configured:
+            google_status = "skipped"
+        else:
+            google_status = "disabled"
+
+        for district in HCM_DISTRICTS:
+            name = district["district"]
+            payload_pair = payloads.get(name)
+            district_air_rows = list(google_rows_by_district.get(name, []))
+
+            if payload_pair is None:
+                air_quality_rows.extend(district_air_rows)
+                continue
+
+            cams_payload, weather_payload = payload_pair
+
+            try:
+                weather_rows.extend(
+                    build_weather_hourly_rows(district, weather_payload, timezone_name, now)
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    {"district": name, "stage": "weather_hourly", "error": scrub(str(exc))}
+                )
+
+            # CAMS air quality is stored only as a fallback: when Google is not
+            # configured at all, or when its call for this district failed.
+            needs_cams_fallback = not district_air_rows and (
+                not google_configured or google_status in {"failed", "partial_success"}
+            )
+            if needs_cams_fallback:
+                try:
+                    district_air_rows = build_cams_hourly_rows(
+                        district, cams_payload, timezone_name, now
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(
+                        {"district": name, "stage": "cams_hourly", "error": scrub(str(exc))}
+                    )
+
+            air_quality_rows.extend(district_air_rows)
+
+        if not weather_rows and not air_quality_rows and not payloads:
+            raise RuntimeError("No district rows were fetched successfully")
+
+        if weather_rows:
+            supabase.upsert("weather_hourly", weather_rows, "district,observed_at")
+        if air_quality_rows:
+            supabase.upsert(
+                "air_quality_hourly", air_quality_rows, "district,observed_at,source"
+            )
+
+        # district_air_weather_latest is written from the newest stored hour.
+        try:
+            stored_air_quality = fetch_recent_stored_air_quality(supabase)
+        except Exception as exc:  # noqa: BLE001 - fall back to this run's rows.
+            print(
+                f"Could not read back stored hourly rows ({scrub(str(exc))}); "
+                "using this run's rows instead.",
+                file=sys.stderr,
+            )
+            stored_air_quality = {}
+            for row in air_quality_rows:
+                stored_air_quality.setdefault(row["district"], []).append(row)
+
+        for district in HCM_DISTRICTS:
+            name = district["district"]
+            payload_pair = payloads.get(name)
+            if payload_pair is None:
+                continue
+            cams_payload, weather_payload = payload_pair
+            try:
+                latest_rows.append(
+                    build_latest_row(
+                        district,
+                        newest_air_quality_row(stored_air_quality.get(name, [])),
+                        cams_payload,
+                        weather_payload,
+                        timezone_name,
+                        now,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    {"district": name, "stage": "latest", "error": scrub(str(exc))}
+                )
+
+        if not latest_rows:
+            raise RuntimeError("No district rows were fetched successfully")
+
+        supabase.upsert("district_air_weather_latest", latest_rows, "district")
+
+        # Reported from what the dashboard will actually display, which on an
+        # unscheduled hour is the Google data stored by the previous run.
+        displayed_sources = {row["air_quality_source"] for row in latest_rows}
+        if displayed_sources == {SOURCE_GOOGLE}:
+            air_quality_source = SOURCE_GOOGLE
+        elif displayed_sources == {SOURCE_CAMS}:
+            air_quality_source = SOURCE_CAMS
+        elif displayed_sources:
+            air_quality_source = "mixed"
+        else:
+            air_quality_source = None
         status = "success" if not failures else "partial_success"
+
         supabase.request(
             "PATCH",
             "air_quality_pipeline_runs",
             body={
                 "status": status,
-                "rows_processed": len(rows),
+                "rows_processed": len(latest_rows),
                 "rows_failed": len(failures),
                 "error_message": json.dumps(failures, ensure_ascii=False) if failures else None,
+                "air_quality_source": air_quality_source,
+                "google_status": google_status,
+                "google_api_calls": GOOGLE_API_CALLS,
+                "open_meteo_status": open_meteo_status,
+                "open_meteo_api_calls": API_REQUESTS_ATTEMPTED,
+                "air_quality_rows": len(air_quality_rows),
+                "weather_rows": len(weather_rows),
                 "ended_at": utc_now_iso(),
             },
             params={"run_id": f"eq.{run_id}"},
             prefer="return=minimal",
         )
+
         print(
             json.dumps(
                 {
                     "status": status,
-                    "rows_processed": len(rows),
+                    "rows_processed": len(latest_rows),
                     "rows_failed": len(failures),
                     "failures": failures,
-                    "api_requests_attempted": API_REQUESTS_ATTEMPTED,
+                    "air_quality_source": air_quality_source,
+                    "google_mode": google_mode,
+                    "google_status": google_status,
+                    "google_error": google_error,
+                    "google_api_calls": GOOGLE_API_CALLS,
+                    "open_meteo_status": open_meteo_status,
+                    "open_meteo_api_calls": API_REQUESTS_ATTEMPTED,
+                    "air_quality_rows": len(air_quality_rows),
+                    "weather_rows": len(weather_rows),
                     "batch_size": BATCH_SIZE,
                     "duration_seconds": round(time.monotonic() - started_monotonic, 2),
                 },
@@ -574,22 +1175,30 @@ def main() -> int:
                 indent=2,
             )
         )
-        rows_processed = len(rows)
+
         if failures:
-            failed_districts = ", ".join(failure["district"] for failure in failures)
-            print(f"Partial success. Failed districts: {failed_districts}", file=sys.stderr)
-        return 0 if rows_processed > 0 else 1
+            failed_districts = ", ".join(
+                f"{failure['district']}/{failure.get('stage', '?')}" for failure in failures
+            )
+            print(f"Partial success. Failed stages: {failed_districts}", file=sys.stderr)
+        return 0 if latest_rows else 1
     except Exception as exc:
-        failure_details = failures or [{"district": "global", "error": str(exc)}]
+        message = scrub(str(exc))
+        failure_details = failures or [{"district": "global", "stage": "pipeline", "error": message}]
         try:
             supabase.request(
                 "PATCH",
                 "air_quality_pipeline_runs",
                 body={
                     "status": "failed",
-                    "rows_processed": len(rows),
+                    "rows_processed": len(latest_rows),
                     "rows_failed": len(failure_details),
-                    "error_message": str(exc),
+                    "error_message": message,
+                    "google_status": google_status,
+                    "google_api_calls": GOOGLE_API_CALLS,
+                    "open_meteo_api_calls": API_REQUESTS_ATTEMPTED,
+                    "air_quality_rows": len(air_quality_rows),
+                    "weather_rows": len(weather_rows),
                     "ended_at": utc_now_iso(),
                 },
                 params={"run_id": f"eq.{run_id}"},
@@ -600,18 +1209,19 @@ def main() -> int:
                 json.dumps(
                     {
                         "status": "failed",
-                        "rows_processed": len(rows),
+                        "rows_processed": len(latest_rows),
                         "rows_failed": len(failure_details),
                         "failures": failure_details,
-                        "api_requests_attempted": API_REQUESTS_ATTEMPTED,
-                        "batch_size": BATCH_SIZE,
+                        "google_status": google_status,
+                        "google_api_calls": GOOGLE_API_CALLS,
+                        "open_meteo_api_calls": API_REQUESTS_ATTEMPTED,
                         "duration_seconds": round(time.monotonic() - started_monotonic, 2),
                     },
                     ensure_ascii=False,
                     indent=2,
                 )
             )
-            print(f"Pipeline failed: {exc}", file=sys.stderr)
+            print(f"Pipeline failed: {message}", file=sys.stderr)
         return 1
 
 

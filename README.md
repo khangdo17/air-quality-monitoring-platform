@@ -6,7 +6,7 @@ Minh City, with 24 hours of hourly history.
 Live demo: https://www.khangdo.dev/air-quality
 
 Public GitHub repository:
-https://github.com/dokhang1703/air-quality-monitoring-platform
+https://github.com/khangdo17/air-quality-monitoring-platform
 
 This repository is safe to publish as a standalone public project. The
 production dashboard frontend is embedded in the private `khangdo.dev`

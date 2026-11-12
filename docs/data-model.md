@@ -208,3 +208,28 @@ the cutoff from both hourly tables and returns the counts. It is
 `security definer` and executable only by `service_role`. See
 `supabase/migrations/20261111120100_hourly_history_retention.sql` for the
 pg_cron scheduling snippet.
+
+## What the first production run showed
+
+The first scheduled production run (Google disabled, so every hourly row came
+from `open_meteo_cams` — one row per district per hour) wrote **18 districts ×
+39 hourly rows = 702 rows** to each hourly table.
+
+The 39 is not a fixed number. Both hourly feeds are requested with
+`past_days=1`, which returns data from **midnight local time yesterday** up to
+the latest available hour, not a rolling 24-hour window. So the row count per
+district swings with the time of day the run fires: **24 hours just after
+midnight, up to 47 hours just before midnight**. 39 was simply where the clock
+sat on this run. Any dashboard or check that assumes exactly 24 (or exactly
+39) rows per district is wrong; expect a count in the 24–47 range.
+
+### District differences are mostly model-cell effects
+
+At the latest stored hour, the **18 districts carried only 2 distinct US AQI
+values**. That is not a data error. Open-Meteo CAMS is a ~25 km model grid (see
+[api-sources.md](api-sources.md)), so all 18 Ho Chi Minh City districts fall
+into roughly one or two grid cells and share a cell's value. The variation the
+map shows between districts on CAMS is therefore mostly a model-cell effect,
+**not a measurement of real district-to-district differences**. Honest
+district-level variation is the reason the Google Air Quality integration
+(~500 m) exists; it is not currently called.

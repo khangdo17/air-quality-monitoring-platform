@@ -185,3 +185,21 @@ as-is; both land in the same `timestamptz` column and compare correctly.
   resolution is not the same as a physical monitor in every district.
 - District values should be described as coordinate-based estimates, not
   readings from physical sensors in every district.
+
+## First production run (observed)
+
+The first scheduled production run confirmed the CAMS resolution limit in the
+data itself.
+
+- **Row counts.** With Google disabled, every hourly row came from
+  `open_meteo_cams` (one row per district per hour). The run wrote **18
+  districts × 39 rows = 702 rows** to each hourly table. The 39 varies with
+  run time: `past_days=1` returns from **midnight local yesterday**, so a run
+  stores **24 hours just after midnight and up to 47 just before midnight** —
+  not a fixed 24-hour window. See [data-model.md](data-model.md).
+- **Grid coarseness, measured.** At the latest stored hour the 18 districts
+  held **only 2 distinct US AQI values**. All 18 districts fall into roughly
+  one or two cells of the ~25-45 km CAMS grid, so they share a cell's value.
+  The district-to-district variation the map shows on CAMS is **mostly a
+  model-cell effect, not a real measured difference** between districts. This
+  is exactly the limitation the ~500 m Google integration was built to remove.

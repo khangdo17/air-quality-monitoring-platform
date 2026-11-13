@@ -15,58 +15,108 @@ portfolio source.
 ## Data Flow
 
 ```text
-Open-Meteo Air Quality API
-Open-Meteo Weather API
-          |
-          v
-GitHub Actions cron
-          |
-          v
-Python ingestion script
-          |
-          v
-Supabase REST API
-          |
-          v
-PostgreSQL latest district table + pipeline runs
-          |
-          v
-khangdo.dev /air-quality dashboard
+Google Air Quality API            Open-Meteo Air Quality      Open-Meteo
+  history:lookup only               (CAMS global)              Forecast API
+  ~500 m, hourly                    ~25-45 km, 2x daily        hourly
+  even hours only                   every hour                 every hour
+        |                                 |                         |
+        |  primary air quality            |  fallback + SO2/CO/UV   |  weather
+        +---------------+-----------------+-------------------------+
+                        |
+                        v
+             GitHub Actions cron (hourly)
+                        |
+                        v
+                Python ingestion script
+                        |
+                        v
+                  Supabase REST API
+                        |
+        +---------------+---------------+---------------+
+        v               v               v               v
+ air_quality_hourly  weather_hourly  district_air    air_quality
+ (24h AQ chart)      (24h weather)   _weather_latest _pipeline_runs
+                                     (dashboard)     (observability)
+                        |
+                        v
+          khangdo.dev /air-quality dashboard
 ```
 
 ## Components
 
+### Google Air Quality API
+
+The primary air quality source, at roughly 500 m resolution. Only
+`history:lookup` is called, for the licensing reason in
+[attribution-and-terms.md](attribution-and-terms.md): historic values may be
+stored, current and forecast values may not be held beyond an hour.
+
+Called on even hours, once per district, asking for the last 4 hours. The
+window is double the cadence so that a cron run GitHub never fires costs no
+data: the runs either side already cover its hours. Still 18 calls per run and
+~6,480 calls per month, because one district-run is one page either way.
+
+The key is sent in the `X-Goog-Api-Key` header and scrubbed from any error text
+the script logs or stores.
+
 ### Open-Meteo APIs
 
-The pipeline calls separate Weather and Air Quality endpoints for each
-configured Ho Chi Minh City district coordinate.
+The weather source, and the air quality fallback. Called on every run, batched
+six districts per request. CAMS global is a ~25-45 km grid on 3-hourly steps
+updated about twice a day, which is why the 18 districts previously showed
+nearly identical values.
+
+Open-Meteo also supplies `so2`, `co` and `uv_index`, which are not requested
+from Google.
 
 ### GitHub Actions
 
-The workflow runs every 15 minutes and can also be triggered manually with
-`workflow_dispatch`.
+The workflow runs hourly at minute 7 and can be triggered manually with
+`workflow_dispatch`. It previously ran every 15 minutes, which mostly re-fetched
+an unchanged CAMS forecast.
+
+`GOOGLE_AQ_ENABLED` is the master switch for the Google Air Quality API and
+defaults to `false`. While it is off the pipeline never calls Google — a key in
+`GOOGLE_MAPS_API_KEY` is ignored — and runs on Open-Meteo alone at CAMS
+resolution. It is off because Google Maps Platform Terms of Service 3.2.3(e)
+forbids using a Core Service "with or near a non-Google Map" and `/air-quality`
+renders a custom Three.js map; see
+[attribution-and-terms.md](attribution-and-terms.md).
+
+`GOOGLE_MAPS_API_KEY` is optional even when the switch is on; without it the
+run records `google_status = 'unconfigured'` and falls back to CAMS.
 
 ### Python Ingestion
 
-The script:
+Each run:
 
-1. Loads environment variables.
-2. Creates a pipeline run row.
-3. Iterates through the configured district list.
-4. Fetches weather and air quality data per district coordinate.
-5. Normalizes fields into the dashboard schema.
-6. Upserts all successful district rows into Supabase.
-7. Updates the pipeline run with success, partial success, or failure metadata.
+1. Loads environment variables and opens a pipeline run row.
+2. Fetches Open-Meteo air quality and weather for all 18 districts, batched.
+3. If `GOOGLE_AQ_ENABLED=true`, on even hours with a key present, calls Google
+   `history:lookup` once per district for the last 4 hours. Off by default, so
+   today this step is skipped and the run records `google_status = 'disabled'`.
+4. Writes every weather hour at or before the current hour to `weather_hourly`.
+5. Writes Google hours to `air_quality_hourly` as `google_aq`; writes CAMS
+   hours as `open_meteo_cams` only where Google did not supply the district.
+6. Reads back the most recent stored hours and writes
+   `district_air_weather_latest` from the newest one, preferring `google_aq`.
+7. Updates the run row with per-source status and call counts.
+
+Step 6 is a read-back rather than a reuse of step 5's rows on purpose. On an
+hour when Google is not scheduled, nothing new is written, and building the
+latest row from the current run's data alone would fall back to the coarse CAMS
+payload and overwrite the Google values — flipping the dashboard's source and
+its attribution every other hour.
 
 ### Supabase PostgreSQL
 
-Supabase stores:
+Four tables, described in [data-model.md](data-model.md). RLS select policies
+allow the dashboard to read using the anon key. Writes are performed only with
+the service role key in GitHub Actions.
 
-- `district_air_weather_latest`: latest district-level dashboard snapshot.
-- `air_quality_pipeline_runs`: ingestion execution metadata.
-
-RLS select policies allow the dashboard to read using the anon key. Writes are
-performed only with the service role key in GitHub Actions.
+Hourly history is retained for 30 days via an optional
+`prune_hourly_history()` job. That window is a storage choice: Google's terms
+permit storing historic values until the agreement is terminated.
 
 ### Dashboard
 
@@ -75,17 +125,34 @@ The live frontend is embedded in:
 https://www.khangdo.dev/air-quality
 
 It reads the latest district rows when Supabase is configured and falls back to
-sample data if live data is unavailable.
+sample data if live data is unavailable. The 24-hour view reads
+`air_quality_hourly` and `weather_hourly`.
+
+The dashboard must render its attribution line from
+`district_air_weather_latest.air_quality_source`, not hard-coded. See
+[attribution-and-terms.md](attribution-and-terms.md) for the exact strings.
 
 ## Security Boundary
 
 The Supabase service role key must stay in GitHub Actions secrets or a local
 uncommitted `.env`. It must never be exposed in frontend code.
 
+The Google API key cannot be IP-restricted, because GitHub-hosted runners have
+no stable egress IP. It is instead restricted to the Air Quality API alone and
+capped by a daily quota, so a leak is bounded in both scope and cost. See
+[google-cloud-setup.md](google-cloud-setup.md).
+
+Both keys are registered with the script's scrubber at startup and replaced
+with `***` in anything written to stderr or to `air_quality_pipeline_runs`.
+
 ## Failure Handling
 
-- Per-district failures are captured and reported in `error_message`.
-- Partial runs still upsert successful districts and mark the run as
-  `partial_success`.
-- If no district succeeds, the run is marked `failed`.
+- Per-district, per-stage failures are captured in `error_message` with a
+  `stage` label, and the run is marked `partial_success`.
+- A Google failure is not an outage: the district falls back to Open-Meteo
+  CAMS for that hour, and `air_quality_source` records what was actually used.
+- Non-retryable Google responses (4xx other than 429) fail immediately rather
+  than retrying, so a quota or key problem cannot multiply into a call storm.
+- Open-Meteo batch failures fall back to per-district requests.
+- If no district succeeds at all, the run is marked `failed`.
 - The dashboard can continue rendering sample data if Supabase is unavailable.
